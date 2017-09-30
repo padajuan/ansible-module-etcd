@@ -17,15 +17,17 @@
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 #
 
+from __future__ import absolute_import, division, print_function
+__metaclass__ = type
 
-ANSIBLE_METADATA = {'metadata_version': '1.0',
+ANSIBLE_METADATA = {'metadata_version': '1.1',
                     'status': ['preview'],
                     'supported_by': 'community'}
 
 DOCUMENTATION = """
 ---
 module: etcd
-short_description: Set and delete values from etcd
+short_description: Set, Retrieve and delete values from etcd
 description:
   - Sets or deletes values in etcd.
   - Parent directories of the key will be created if they do not already exist.
@@ -39,7 +41,7 @@ options:
       - This will be the state of the key in etcd
       - after this module completes its operations.
     required: true
-    choices: [present, absent]
+    choices: [present, absent, directory]
     default: null
   protocol:
     description:
@@ -64,13 +66,13 @@ options:
     default: '/v2'
   key:
     description:
-      - The key in etcd at which to set the value
+      - The key in etcd at which to set/get the value
     required: true
     default: null
   value:
     description:
       - The value to be set in etcd
-    required: true
+    required: false
     default: null
   override:
     description:
@@ -110,6 +112,11 @@ options:
       - Password to authenticate to ETCD with RBAC activated
     required: false
     default: None
+  recursive:
+    description:
+      - Used with state:absent, will recursively delete a directory
+    required: false
+    default: false
 
 notes:
   - Do not override the value stored on ETCD, you must specify it.
@@ -125,18 +132,18 @@ EXAMPLES = """
 ---
 # set a value in etcd
 - etcd:
-    state=present
-    host=my-etcd-host.example.com
-    port=4001
-    key=/asdf/foo/bar/baz/gorp
-    value=my-foo-bar-baz-gor-server.prod.example.com
+    state: present
+    host: my-etcd-host.example.com
+    port: 4001
+    key: /asdf/foo/bar/baz/gorp
+    value: my-foo-bar-baz-gor-server.prod.example.com
 
 # delete a value from etcd
 - etcd:
-    state=absent
-    host=my-etcd-host.example.com
-    port=4001
-    key=/asdf/foo/bar/baz/gorp
+    state: absent
+    host: my-etcd-host.example.com
+    port: 4001
+    key: /asdf/foo/bar/baz/gorp
 
 # override an existant ETCD value
 - etcd:
@@ -196,20 +203,21 @@ def main():
 
     module = AnsibleModule(
         argument_spec=dict(
-            state=dict(required=True, choices=['present', 'absent']),
-            protocol=dict(required=False, default='http', choices=['http', 'https']),
-            host=dict(required=False, default='127.0.0.1'),
+            state=dict(required=True, type='str', choices=['present', 'absent', 'directory']),
+            protocol=dict(required=False, type='str', default='http', choices=['http', 'https']),
+            host=dict(required=False, type='str', default='127.0.0.1'),
             port=dict(required=False, default=4001, type='int'),
-            api_version=dict(required=False, default='/v2'),
-            key=dict(required=True),
+            api_version=dict(required=False, type='str', default='/v2'),
+            key=dict(required=True, type='str'),
             value=dict(required=False, default=None),
-            override=dict(required=False, default=False),
-            allow_redirect=dict(required=False, default=True),
+            override=dict(required=False, type='bool', default=False),
+            allow_redirect=dict(required=False, type='bool', default=True),
             read_timeout=dict(required=False, default=60, type='int'),
-            cert=dict(required=False, default=None),
-            ca_cert=dict(required=False, default=None),
-            username=dict(required=False, default=None),
-            password=dict(required=False, default=None, no_log=True)
+            cert=dict(required=False, type='str', default=None),
+            ca_cert=dict(required=False, type='str', default=None),
+            username=dict(required=False, type='str', default=None),
+            password=dict(required=False, type='str', default=None, no_log=True),
+            recursive=dict(required=False, type='bool', default=False),
         ),
         supports_check_mode=True
     )
@@ -239,9 +247,6 @@ def main():
     # Config
     override = module.params['override']
 
-    if state == 'present' and not value:
-        module.fail_json(msg='Value is required with state="present".')
-
     kwargs = {
         'protocol': target_scheme,
         'host': target_host,
@@ -256,8 +261,7 @@ def main():
     }
 
     client = etcd.Client(**kwargs)
-
-    change = False
+    results = dict(changed=False, key=key, dir=False)
     prev_value = None
 
     # Attempt to get key
@@ -269,47 +273,100 @@ def main():
         # There is not value on ETCD
         prev_value = None
 
+    # Now get all the data in the key
+    try:
+        full_record = client.read(key)
+        data = dict()
+        data['key'] = full_record.key
+
+        if full_record.dir:
+            data['dir'] = True
+            results['dir'] = True
+        else:
+            data['value'] = full_record.value
+            results['value'] = full_record.value
+            data['dir'] = False
+
+        if full_record._children:
+            data['children'] = dict()
+            for child in full_record._children:
+                data['children'][child['key']] = child
+        results['data'] = data
+
+    except etcd.EtcdKeyNotFound:
+        data = None
+
     # Handle check mode
     if module.check_mode:
-        if ((state == 'absent' and prev_value is not None) or
+        if state == 'present' and value is None and prev_value is not None:
+            results['changed'] = False
+        elif ((state == 'absent' and prev_value is not None) or
                 (state == 'present' and prev_value != value)):
-                    change = True
-        module.exit_json(changed=change)
+                    results['changed'] = True
+        module.exit_json(**results)
 
-    if state == 'present' and prev_value is None:
-        # If 'Present' and there is not a previous value on ETCD
-        try:
-            set_res = client.write(key, value)
-            change = True
-        except ConnectionError:
-            module.fail_json(msg="Cannot connect to target.")
-
-    elif state == 'present' and prev_value is not None:
-        # If 'Present' and exists a previous value on ETCD
-        if prev_value == value:
-            # The value to set, is already present
-            change = False
-        elif override == 'True':
-            # Trying to Override already existant key on ETCD with flag
-            set_res = client.write(key, value)
-            change = True
+    # we are making a directory
+    if state == 'directory':
+        if prev_value is None and not results['dir']:
+            client.write(key, None, dir=True)
+            results['changed'] = True
+            results['dir'] = True
         else:
-            # Trying to Override already existant key on ETCD without flag
-            module.fail_json(msg="The Key '%s' is already set with '%s', exiting..." % (key, prev_value))
+            if results['dir']:
+                module.exit_json(**results)
+            else:
+                module.fail_json(msg="A non-directory key already exists at {0}".format(key))
 
-    elif state == 'absent':
-        if prev_value is not None:
+    # lets handle create mode
+    elif state == 'present':
+        if prev_value is None:
+            if value is None:
+                module.fail_json(msg="Key {0} does not exist and new value not provided.".format(key))
+            # If 'Present' and there is not a previous value on ETCD
             try:
-                set_res = client.delete(key)
-                change = True
+                set_res = client.write(key, value)
+                results['changed'] = True
             except ConnectionError:
                 module.fail_json(msg="Cannot connect to target.")
+        elif prev_value is not None:
+            # If 'Present' and exists a previous value on ETCD
+            if prev_value == value or value is None:
+                # The value to set, is already present
+                results['changed'] = False
+            elif override:
+                # Trying to Override already existant key on ETCD with flag
+                set_res = client.write(key, value)
+                results['changed'] = True
+            else:
+                # Trying to Override already existant key on ETCD without flag
+                module.fail_json(msg="The Key '%s' is already set with '%s', exiting..." % (key, prev_value))
+        else:
+            module.fail_json(msg="prev_value is nonsense")
 
-    results = {
-        'changed': change,
-        'value': value,
-        'key': key
-    }
+    # And finally delete mode
+    elif state == 'absent':
+        if prev_value is None:
+            # nothing to do here
+            results['changed'] = False
+        elif data['dir']:
+            # We want to delete a directory
+            if data['children'] is None and module.params['recursive']:
+                try:
+                    client.delete(key, recursive=True)
+                except Exception as e:
+                    module.fail_json(msg="Directory delete failed: {0}".format(str(e)))
+            elif data['children'] is None:
+                try:
+                    client.delete(key, dir=True)
+                except:
+                    module.fail_json(msg="Directory {0} has child objects and recursive was not set".format(key))
+        else:
+            # Not a directory, we want to delete a key, and it has a prev_value
+            try:
+                set_res = client.delete(key)
+                results['changed'] = True
+            except ConnectionError:
+                module.fail_json(msg="Cannot connect to target.")
 
     module.exit_json(**results)
 
